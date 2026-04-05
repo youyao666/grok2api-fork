@@ -48,6 +48,7 @@ class TokenInfo(BaseModel):
     """Token 信息"""
 
     token: str
+    pool_name: Optional[str] = None
     status: TokenStatus = TokenStatus.ACTIVE
     quota: int = BASIC__DEFAULT_QUOTA
 

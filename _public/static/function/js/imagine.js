@@ -10,6 +10,7 @@
   const reverseInsertToggle = document.getElementById('reverseInsertToggle');
   const autoFilterToggle = document.getElementById('autoFilterToggle');
   const nsfwSelect = document.getElementById('nsfwSelect');
+  const qualitySelect = document.getElementById('qualitySelect');
   const selectFolderBtn = document.getElementById('selectFolderBtn');
   const folderPath = document.getElementById('folderPath');
   const statusText = document.getElementById('statusText');
@@ -217,14 +218,14 @@
     }
   }
 
-  async function createImagineTask(prompt, ratio, authHeader, nsfwEnabled) {
+  async function createImagineTask(prompt, ratio, authHeader, nsfwEnabled, quality) {
     const res = await fetch('/v1/function/imagine/start', {
       method: 'POST',
       headers: {
         ...buildAuthHeaders(authHeader),
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ prompt, aspect_ratio: ratio, nsfw: nsfwEnabled })
+      body: JSON.stringify({ prompt, aspect_ratio: ratio, nsfw: nsfwEnabled, quality })
     });
     if (!res.ok) {
       const text = await res.text();
@@ -234,10 +235,10 @@
     return data && data.task_id ? String(data.task_id) : '';
   }
 
-  async function createImagineTasks(prompt, ratio, concurrent, authHeader, nsfwEnabled) {
+  async function createImagineTasks(prompt, ratio, concurrent, authHeader, nsfwEnabled, quality) {
     const tasks = [];
     for (let i = 0; i < concurrent; i++) {
-      const taskId = await createImagineTask(prompt, ratio, authHeader, nsfwEnabled);
+      const taskId = await createImagineTask(prompt, ratio, authHeader, nsfwEnabled, quality);
       if (!taskId) {
         throw new Error('Missing task id');
       }
@@ -679,7 +680,8 @@
     const concurrent = concurrentSelect ? parseInt(concurrentSelect.value, 10) : 1;
     const ratio = ratioSelect ? ratioSelect.value : '2:3';
     const nsfwEnabled = nsfwSelect ? nsfwSelect.value === 'true' : true;
-    
+    const quality = qualitySelect ? qualitySelect.value : 'standard';
+
     if (isRunning) {
       toast(t('common.alreadyRunning'), 'warning');
       return;
@@ -696,7 +698,7 @@
 
     let taskIds = [];
     try {
-      taskIds = await createImagineTasks(prompt, ratio, concurrent, authHeader, nsfwEnabled);
+      taskIds = await createImagineTasks(prompt, ratio, concurrent, authHeader, nsfwEnabled, quality);
     } catch (e) {
       setStatus('error', t('common.createTaskFailed'));
       startBtn.disabled = false;
@@ -795,11 +797,13 @@
     const prompt = promptOverride || (promptInput ? promptInput.value.trim() : '');
     const ratio = ratioSelect ? ratioSelect.value : '2:3';
     const nsfwEnabled = nsfwSelect ? nsfwSelect.value === 'true' : true;
+    const quality = qualitySelect ? qualitySelect.value : 'standard';
     const payload = {
       type: 'start',
       prompt,
       aspect_ratio: ratio,
-      nsfw: nsfwEnabled
+      nsfw: nsfwEnabled,
+      quality
     };
     ws.send(JSON.stringify(payload));
     updateError('');

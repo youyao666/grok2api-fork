@@ -23,6 +23,7 @@
         <div>
           <h2 class="text-2xl font-semibold tracking-tight" data-i18n="imagine.title">Imagine 瀑布流</h2>
           <p class="text-[var(--accents-4)] mt-1 text-sm" data-i18n="imagine.subtitle">通过 WebSocket 持续生成图片，实时展示 base64 瀑布流。</p>
+          <p class="text-[var(--accents-4)] mt-2 text-xs" data-i18n="imagine.modelHint">当前图片生成仅保留 imagine-x-1 模型。</p>
         </div>
 
         <div class="h-px bg-[var(--border)]"></div>
@@ -101,6 +102,13 @@
                     <select id="nsfwSelect" class="geist-input">
                       <option value="true" data-i18n="imagine.nsfwOn">开启</option>
                       <option value="false" data-i18n="imagine.nsfwOff">关闭</option>
+                    </select>
+                  </div>
+                  <div class="settings-field">
+                    <label class="field-label" for="qualitySelect" data-i18n="imagine.qualityLabel">图片质量</label>
+                    <select id="qualitySelect" class="geist-input">
+                      <option value="standard" data-i18n="imagine.qualityStandard">标准</option>
+                      <option value="hd" data-i18n="imagine.qualityHd">高清 (HD)</option>
                     </select>
                   </div>
                   <div class="settings-folder">

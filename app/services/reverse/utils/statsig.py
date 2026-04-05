@@ -33,10 +33,9 @@ class StatsigGenerator:
         """
         dynamic = get_config("app.dynamic_statsig")
 
-        # Dynamic Statsig ID
         if dynamic:
             logger.debug("Generating dynamic Statsig ID")
-            
+
             if random.choice([True, False]):
                 rand = StatsigGenerator._rand(5, alphanumeric=True)
                 message = f"e:TypeError: Cannot read properties of null (reading 'children['{rand}']')"
@@ -48,7 +47,6 @@ class StatsigGenerator:
 
             return base64.b64encode(message.encode()).decode()
 
-        # Static Statsig ID
         logger.debug("Generating static Statsig ID")
         return "ZTpUeXBlRXJyb3I6IENhbm5vdCByZWFkIHByb3BlcnRpZXMgb2YgdW5kZWZpbmVkIChyZWFkaW5nICdjaGlsZE5vZGVzJyk="
 

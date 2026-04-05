@@ -388,7 +388,9 @@ class TokenManager:
             logger.debug(f"No available token in pool '{pool_name}'")
             return None
 
-        return token_info
+        token_info_view = token_info.model_copy(deep=False)
+        token_info_view.pool_name = pool_name
+        return token_info_view
 
     def get_token_for_video(
         self,

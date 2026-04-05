@@ -32,6 +32,8 @@ from app.services.grok.utils.process import (
 from app.services.grok.utils.retry import rate_limited
 from app.services.grok.utils.stream import wrap_stream_with_usage
 from app.services.reverse.app_chat import AppChatReverse
+from app.services.reverse.assets_detail import AssetsDetailReverse
+from app.services.reverse.assets_list import AssetsListReverse
 from app.services.reverse.media_post import MediaPostReverse
 from app.services.reverse.media_post_link import MediaPostLinkReverse
 from app.services.reverse.utils.session import ResettableSession
@@ -185,6 +187,31 @@ def _build_mode_flag(preset: str) -> str:
 
 def _build_message(prompt: str, preset: str) -> str:
     return f"{prompt} {_build_mode_flag(preset)}".strip()
+
+
+def _build_image_to_video_message(
+    prompt: str, image_urls: List[str], preset: str
+) -> str:
+    """Build a web-like message for image-to-video requests.
+
+    Grok web sends image-to-video through app-chat with the uploaded asset URL in the
+    message body and the uploaded asset id in both fileAttachments and parentPostId.
+    We keep any user prompt, but anchor the message to the uploaded image URL(s) so
+    the request stays closer to the browser flow.
+    """
+    parts: List[str] = []
+    parts.extend(url.strip() for url in image_urls if isinstance(url, str) and url.strip())
+    if isinstance(prompt, str) and prompt.strip():
+        parts.append(prompt.strip())
+    body = "\n".join(parts).strip()
+    return _build_message(body or prompt, preset)
+
+
+def _pick_image_parent_post_id(asset_ids: List[str]) -> str:
+    for asset_id in asset_ids:
+        if isinstance(asset_id, str) and asset_id.strip():
+            return asset_id.strip()
+    raise ValidationException("Reference image metadata mismatch")
 
 
 def _build_base_config(
@@ -621,6 +648,7 @@ async def _request_round_stream(
     message: str,
     model_config_override: Dict[str, Any],
     file_attachments: Optional[List[str]] = None,
+    minimal_payload: bool = False,
 ) -> AsyncGenerator[bytes, None]:
     async def _stream():
         session = _new_session()
@@ -634,6 +662,7 @@ async def _request_round_stream(
                     file_attachments=file_attachments,
                     tool_overrides={"videoGen": True},
                     model_config_override=model_config_override,
+                    minimal_payload=minimal_payload,
                 )
                 async for line in stream_response:
                     yield line
@@ -669,6 +698,41 @@ async def _upscale_video_url(token: str, video_url: str) -> Tuple[str, bool]:
         logger.warning(f"Video upscale failed: {e}")
 
     return video_url, False
+
+
+async def _warmup_image_video_context(token: str, asset_ids: List[str]):
+    """
+    Replay the lightweight asset reads the browser performs before kicking off
+    image-to-video generation. These requests are intentionally best-effort:
+    failure should not block generation, but they help align the request flow.
+    """
+    if not asset_ids:
+        return
+
+    try:
+        async with _new_session() as session:
+            try:
+                await AssetsListReverse.request(
+                    session,
+                    token,
+                    {
+                        "pageSize": 24,
+                        "mimeTypes": ["image/jpeg", "image/jpg", "image/png", "image/webp"],
+                        "orderBy": "ORDER_BY_LAST_USE_TIME",
+                        "source": "SOURCE_UPLOADED",
+                        "includeImagineFiles": "true",
+                    },
+                )
+            except Exception as e:
+                logger.debug(f"Video asset list warmup skipped: {e}")
+
+            for asset_id in asset_ids:
+                try:
+                    await AssetsDetailReverse.request(session, token, asset_id)
+                except Exception as e:
+                    logger.debug(f"Video asset detail warmup skipped for {asset_id}: {e}")
+    except Exception as e:
+        logger.debug(f"Video warmup session skipped: {e}")
 
 
 def _resolve_upscale_timing() -> str:
@@ -856,25 +920,11 @@ class VideoService:
             f"Image to video: prompt='{prompt[:50]}...', images={len(image_urls)}"
         )
         post_id = await self.create_post(token, prompt)
-        mode_map = {
-            "fun": "--mode=extremely-crazy",
-            "normal": "--mode=normal",
-            "spicy": "--mode=extremely-spicy-or-crazy",
-        }
-        mode_flag = mode_map.get(preset, "--mode=custom")
-        message = f"{prompt} {mode_flag}"
-        model_config_override = {
-            "modelMap": {
-                "videoGenModelConfig": {
-                    "aspectRatio": aspect_ratio,
-                    "imageReferences": image_urls,
-                    "isReferenceToVideo": True,
-                    "parentPostId": post_id,
-                    "resolutionName": resolution,
-                    "videoLength": video_length,
-                }
-            }
-        }
+        message = _build_message(prompt, preset)
+        model_config_override = _build_base_config(post_id, aspect_ratio, resolution, video_length)
+        video_config = model_config_override["modelMap"]["videoGenModelConfig"]
+        video_config["imageReferences"] = image_urls
+        video_config["isReferenceToVideo"] = True
         return await _request_round_stream(
             token=token,
             message=message,
@@ -945,7 +995,11 @@ class VideoService:
             if token.startswith("sso="):
                 token = token[4:]
 
-            pool_name = token_mgr.get_pool_name_for_token(token) or BASIC_POOL_NAME
+            pool_name = (
+                token_info.pool_name
+                or token_mgr.get_pool_name_for_token(token)
+                or BASIC_POOL_NAME
+            )
             is_super_pool = pool_name != BASIC_POOL_NAME
 
             requested_resolution = resolution
@@ -982,6 +1036,7 @@ class VideoService:
                         logger.info(
                             f"Images uploaded for video: count={len(image_urls)}"
                         )
+                        await _warmup_image_video_context(token, asset_ids)
                     finally:
                         await upload_service.close()
                 elif _REFERENCE_PLACEHOLDER_RE.search(prompt_text):
@@ -990,6 +1045,7 @@ class VideoService:
                     )
 
                 service = VideoService()
+                using_image_reference_seed = False
                 message = _build_message(prompt_text, preset)
                 seed_post_id = await service.create_post(token, prompt_text)
 
@@ -1008,25 +1064,31 @@ class VideoService:
                     original_id: Optional[str],
                     source: str,
                 ) -> VideoRoundResult:
-                    config_override = _build_round_config(
-                        plan,
-                        seed_post_id=seed_id,
-                        last_post_id=last_id,
-                        original_post_id=original_id,
-                        prompt=prompt_text,
-                        aspect_ratio=aspect_ratio,
-                        resolution_name=generation_resolution,
-                        image_references=image_urls if plan.round_index == 1 else None,
-                    )
-                    response = await _request_round_stream(
-                        token=token,
-                        message=message,
-                        model_config_override=config_override,
-                        file_attachments=asset_ids if plan.round_index == 1 else None,
-                    )
-                    return await _collect_round_result(
-                        response, model=model, source=source
-                    )
+                        config_override = _build_round_config(
+                            plan,
+                            seed_post_id=seed_id,
+                            last_post_id=last_id,
+                            original_post_id=original_id,
+                            prompt=prompt_text,
+                            aspect_ratio=aspect_ratio,
+                            resolution_name=generation_resolution,
+                            image_references=(
+                                image_urls
+                                if plan.round_index == 1
+                                else None
+                            ),
+                        )
+                        response = await _request_round_stream(
+                            token=token,
+                            message=message,
+                            model_config_override=config_override,
+                            file_attachments=(
+                                asset_ids if plan.round_index == 1 else None
+                            ),
+                        )
+                        return await _collect_round_result(
+                            response, model=model, source=source
+                        )
 
                 async def _stream_chain() -> AsyncGenerator[str, None]:
                     writer = _VideoChainSSEWriter(model, show_think)
@@ -1045,9 +1107,11 @@ class VideoService:
                                 prompt=prompt_text,
                                 aspect_ratio=aspect_ratio,
                                 resolution_name=generation_resolution,
-                                image_references=image_urls
-                                if plan.round_index == 1
-                                else None,
+                                image_references=(
+                                    image_urls
+                                    if plan.round_index == 1
+                                    else None
+                                ),
                             )
                             response = await _request_round_stream(
                                 token=token,

@@ -7,7 +7,7 @@ import orjson
 import re
 import time
 import uuid
-from typing import AsyncGenerator, Dict, Optional
+from typing import Any, AsyncGenerator, Dict, Optional
 
 import aiohttp
 
@@ -36,29 +36,53 @@ class ImagineWebSocketReverse:
             return None, None
         return match.group(1), match.group(2).lower()
 
+    def _is_imagine_x1(self, model: str) -> bool:
+        return model == "imagine-x-1"
+
     def _is_final_image(self, url: str, blob_size: int, final_min_bytes: int) -> bool:
         # Final image must satisfy byte-size threshold to avoid tiny preview
         # images being treated as final outputs.
         return blob_size >= final_min_bytes
 
-    def _classify_image(self, url: str, blob: str, final_min_bytes: int, medium_min_bytes: int) -> Optional[Dict[str, object]]:
+    def _classify_image(
+        self,
+        message: Dict[str, Any],
+        model: str,
+        final_min_bytes: int,
+        medium_min_bytes: int,
+    ) -> Optional[Dict[str, object]]:
+        url = message.get("url", "")
+        blob = message.get("blob", "")
         if not url or not blob:
             return None
 
         image_id, ext = self._parse_image_url(url)
-        image_id = image_id or uuid.uuid4().hex
+        request_id = message.get("request_id")
+        job_id = message.get("job_id") or message.get("id") or image_id
+        image_id = job_id or image_id or uuid.uuid4().hex
         blob_size = len(blob)
-        is_final = self._is_final_image(url, blob_size, final_min_bytes)
+        model_name = message.get("model_name") or model
 
-        stage = (
-            "final"
-            if is_final
-            else ("medium" if blob_size > medium_min_bytes else "preview")
-        )
+        if self._is_imagine_x1(model):
+            is_final = ext in {"jpg", "jpeg"}
+            stage = "final" if is_final else "preview"
+        else:
+            is_final = self._is_final_image(url, blob_size, final_min_bytes)
+            stage = (
+                "final"
+                if is_final
+                else ("medium" if blob_size > medium_min_bytes else "preview")
+            )
+
+        job_key = f"{request_id}:{job_id}" if request_id and job_id else image_id
 
         return {
             "type": "image",
             "image_id": image_id,
+            "job_id": job_id,
+            "job_key": job_key,
+            "request_id": request_id,
+            "model_name": model_name,
             "ext": ext,
             "stage": stage,
             "blob": blob,
@@ -67,7 +91,37 @@ class ImagineWebSocketReverse:
             "is_final": is_final,
         }
 
-    def _build_request_message(self, request_id: str, prompt: str, aspect_ratio: str, enable_nsfw: bool) -> Dict[str, object]:
+    def _build_reset_message(self) -> Dict[str, object]:
+        return {
+            "type": "conversation.item.create",
+            "timestamp": int(time.time() * 1000),
+            "item": {
+                "type": "message",
+                "content": [{"type": "reset"}],
+            },
+        }
+
+    def _build_request_message(
+        self,
+        request_id: str,
+        prompt: str,
+        aspect_ratio: str,
+        enable_nsfw: bool,
+        quality: str,
+        model: str,
+    ) -> Dict[str, object]:
+        properties: Dict[str, Any] = {
+            "section_count": 0,
+            "is_kids_mode": False,
+            "enable_nsfw": enable_nsfw,
+            "skip_upsampler": False,
+            "is_initial": False,
+            "aspect_ratio": aspect_ratio,
+        }
+        if self._is_imagine_x1(model):
+            properties["enable_side_by_side"] = True
+            properties["enable_pro"] = quality == "hd"
+
         return {
             "type": "conversation.item.create",
             "timestamp": int(time.time() * 1000),
@@ -78,14 +132,7 @@ class ImagineWebSocketReverse:
                         "requestId": request_id,
                         "text": prompt,
                         "type": "input_text",
-                        "properties": {
-                            "section_count": 0,
-                            "is_kids_mode": False,
-                            "enable_nsfw": enable_nsfw,
-                            "skip_upsampler": False,
-                            "is_initial": False,
-                            "aspect_ratio": aspect_ratio,
-                        },
+                        "properties": properties,
                     }
                 ],
             },
@@ -98,6 +145,8 @@ class ImagineWebSocketReverse:
         aspect_ratio: str = "2:3",
         n: int = 1,
         enable_nsfw: bool = True,
+        quality: str = "standard",
+        model: str = "grok-imagine-1.0",
         max_retries: Optional[int] = None,
     ) -> AsyncGenerator[Dict[str, object], None]:
         retries = max(1, max_retries if max_retries is not None else 1)
@@ -109,7 +158,7 @@ class ImagineWebSocketReverse:
         async def _collect_once() -> list[Dict[str, object]]:
             items: list[Dict[str, object]] = []
             async for item in self._stream_once(
-                token, prompt, aspect_ratio, n, enable_nsfw
+                token, prompt, aspect_ratio, n, enable_nsfw, quality, model
             ):
                 items.append(item)
             return items
@@ -175,6 +224,8 @@ class ImagineWebSocketReverse:
         aspect_ratio: str,
         n: int,
         enable_nsfw: bool,
+        quality: str,
+        model: str,
     ) -> AsyncGenerator[Dict[str, object], None]:
         request_id = str(uuid.uuid4())
         headers = build_ws_headers(token=token)
@@ -213,8 +264,12 @@ class ImagineWebSocketReverse:
 
         try:
             async with conn as ws:
+                if self._is_imagine_x1(model):
+                    await ws.send_json(self._build_reset_message())
+                    logger.debug("Imagine websocket reset sent for imagine-x-1")
+
                 message = self._build_request_message(
-                    request_id, prompt, aspect_ratio, enable_nsfw
+                    request_id, prompt, aspect_ratio, enable_nsfw, quality, model
                 )
                 await ws.send_json(message)
                 logger.info(f"WebSocket request sent: {prompt[:80]}...")
@@ -222,7 +277,7 @@ class ImagineWebSocketReverse:
                 final_ids: set[str] = set()
                 completed = 0
                 start_time = last_activity = time.monotonic()
-                medium_received_time: Optional[float] = None
+                preview_received_time: Optional[float] = None
 
                 while time.monotonic() - start_time < timeout:
                     try:
@@ -230,12 +285,12 @@ class ImagineWebSocketReverse:
                     except asyncio.TimeoutError:
                         now = time.monotonic()
                         if (
-                            medium_received_time
+                            preview_received_time
                             and completed == 0
-                            and now - medium_received_time > blocked_grace
+                            and now - preview_received_time > blocked_grace
                         ):
                             logger.warning(
-                                "Imagine stream blocked suspected: received medium preview but no valid final image "
+                                "Imagine stream blocked suspected: received preview but no valid final image "
                                 f"within {blocked_grace:.1f}s (request_id={request_id})"
                             )
                             raise _BlockedError()
@@ -256,25 +311,50 @@ class ImagineWebSocketReverse:
 
                         msg_type = msg.get("type")
 
+                        if msg_type == "json":
+                            status = msg.get("current_status")
+                            if status in {"start_stage", "completed"}:
+                                job_id = msg.get("job_id") or msg.get("image_id")
+                                request_id_msg = msg.get("request_id") or request_id
+                                job_key = (
+                                    f"{request_id_msg}:{job_id}"
+                                    if request_id_msg and job_id
+                                    else (job_id or "")
+                                )
+                                yield {
+                                    "type": "job",
+                                    "state": "completed"
+                                    if status == "completed"
+                                    else "started",
+                                    "request_id": request_id_msg,
+                                    "job_id": job_id,
+                                    "job_key": job_key,
+                                    "image_id": msg.get("image_id") or job_id,
+                                    "model_name": msg.get("model_name") or model,
+                                    "width": msg.get("width"),
+                                    "height": msg.get("height"),
+                                }
+                            continue
+
                         if msg_type == "image":
                             info = self._classify_image(
-                                msg.get("url", ""),
-                                msg.get("blob", ""),
+                                msg,
+                                model,
                                 final_min_bytes,
                                 medium_min_bytes,
                             )
                             if not info:
                                 continue
 
-                            image_id = info["image_id"]
-                            if info["stage"] == "medium" and medium_received_time is None:
-                                medium_received_time = time.monotonic()
+                            item_key = info.get("job_key") or info["image_id"]
+                            if not info["is_final"] and preview_received_time is None:
+                                preview_received_time = time.monotonic()
 
-                            if info["is_final"] and image_id not in final_ids:
-                                final_ids.add(image_id)
+                            if info["is_final"] and item_key not in final_ids:
+                                final_ids.add(item_key)
                                 completed += 1
                                 logger.debug(
-                                    f"Final image received: id={image_id}, size={info['blob_size']}"
+                                    f"Final image received: id={item_key}, size={info['blob_size']}"
                                 )
 
                             yield info
@@ -295,9 +375,9 @@ class ImagineWebSocketReverse:
                             break
 
                         if (
-                            medium_received_time
+                            preview_received_time
                             and completed == 0
-                            and time.monotonic() - medium_received_time > final_timeout
+                            and time.monotonic() - preview_received_time > final_timeout
                         ):
                             logger.warning(
                                 "Imagine stream final-timeout suspected review/block: "

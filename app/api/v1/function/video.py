@@ -134,7 +134,7 @@ def _normalize_image_urls(values: Optional[List[str]]) -> List[str]:
 
 
 class VideoStartRequest(BaseModel):
-    prompt: str
+    prompt: Optional[str] = ""
     aspect_ratio: Optional[str] = "3:2"
     video_length: Optional[int] = 6
     resolution_name: Optional[str] = "480p"
@@ -146,8 +146,6 @@ class VideoStartRequest(BaseModel):
 @router.post("/video/start", dependencies=[Depends(verify_function_key)])
 async def function_video_start(data: VideoStartRequest):
     prompt = (data.prompt or "").strip()
-    if not prompt:
-        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
     aspect_ratio = _normalize_ratio(data.aspect_ratio)
     if not aspect_ratio:
@@ -183,6 +181,11 @@ async def function_video_start(data: VideoStartRequest):
         )
     for image_url in image_urls:
         _validate_image_url(image_url)
+    if not prompt and not image_urls:
+        raise HTTPException(
+            status_code=400,
+            detail="Prompt cannot be empty when no reference image is provided",
+        )
 
     reasoning_effort = (data.reasoning_effort or "").strip() or None
     if reasoning_effort:
@@ -225,9 +228,9 @@ async def function_video_sse(request: Request, task_id: str = Query("")):
 
     async def event_stream():
         try:
-            model_id = "grok-imagine-1.0-video"
+            model_id = "grok-3"
             model_info = ModelService.get(model_id)
-            if not model_info or not model_info.is_video:
+            if not model_info:
                 payload = {
                     "error": "Video model is not available.",
                     "code": "model_not_supported",
@@ -237,7 +240,9 @@ async def function_video_sse(request: Request, task_id: str = Query("")):
                 return
 
             if image_urls:
-                content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+                content: List[Dict[str, Any]] = []
+                if prompt:
+                    content.append({"type": "text", "text": prompt})
                 for image_url in image_urls:
                     content.append(
                         {"type": "image_url", "image_url": {"url": image_url}}

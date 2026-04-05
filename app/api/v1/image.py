@@ -21,6 +21,8 @@ from app.core.config import get_config
 
 router = APIRouter(tags=["Images"])
 
+IMAGE_GENERATION_MODEL_IDS = {"imagine-x-1"}
+
 ALLOWED_IMAGE_SIZES = {
     "1280x720",
     "720x1280",
@@ -37,19 +39,20 @@ SIZE_TO_ASPECT = {
     "1024x1024": "1:1",
 }
 ALLOWED_ASPECT_RATIOS = {"1:1", "2:3", "3:2", "9:16", "16:9"}
+ALLOWED_IMAGE_QUALITIES = {"standard", "hd"}
 
 
 class ImageGenerationRequest(BaseModel):
     """图片生成请求 - OpenAI 兼容"""
 
     prompt: str = Field(..., description="图片描述")
-    model: Optional[str] = Field("grok-imagine-1.0", description="模型名称")
+    model: Optional[str] = Field("imagine-x-1", description="模型名称")
     n: Optional[int] = Field(1, ge=1, le=10, description="生成数量 (1-10)")
     size: Optional[str] = Field(
         "1024x1024",
         description="图片尺寸: 1280x720, 720x1280, 1792x1024, 1024x1792, 1024x1024",
     )
-    quality: Optional[str] = Field("standard", description="图片质量 (暂不支持)")
+    quality: Optional[str] = Field("standard", description="图片质量 (standard/hd)")
     response_format: Optional[str] = Field(None, description="响应格式")
     style: Optional[str] = Field(None, description="风格 (暂不支持)")
     stream: Optional[bool] = Field(False, description="是否流式输出")
@@ -66,7 +69,7 @@ class ImageEditRequest(BaseModel):
         "1024x1024",
         description="图片尺寸: 1280x720, 720x1280, 1792x1024, 1024x1792, 1024x1024",
     )
-    quality: Optional[str] = Field("standard", description="图片质量 (暂不支持)")
+    quality: Optional[str] = Field("standard", description="图片质量 (standard/hd)")
     response_format: Optional[str] = Field(None, description="响应格式")
     style: Optional[str] = Field(None, description="风格 (暂不支持)")
     stream: Optional[bool] = Field(False, description="是否流式输出")
@@ -124,12 +127,24 @@ def _validate_common_request(
             code="invalid_size",
         )
 
+    quality = str(request.quality or "standard").strip().lower()
+    if quality not in ALLOWED_IMAGE_QUALITIES:
+        raise ValidationException(
+            message=f"quality must be one of {sorted(ALLOWED_IMAGE_QUALITIES)}",
+            param="quality",
+            code="invalid_quality",
+        )
+    request.quality = quality
+
 
 def validate_generation_request(request: ImageGenerationRequest):
     """验证图片生成请求参数"""
-    if request.model != "grok-imagine-1.0":
+    if request.model not in IMAGE_GENERATION_MODEL_IDS:
         raise ValidationException(
-            message="The model `grok-imagine-1.0` is required for image generation.",
+            message=(
+                "The model for image generation must be one of "
+                f"{sorted(IMAGE_GENERATION_MODEL_IDS)}."
+            ),
             param="model",
             code="model_not_supported",
         )
@@ -289,6 +304,7 @@ async def create_image(request: ImageGenerationRequest):
         size=request.size,
         aspect_ratio=aspect_ratio,
         stream=bool(request.stream),
+        quality=request.quality,
     )
 
     if result.stream:

@@ -23,6 +23,7 @@ from app.services.token.manager import get_token_manager
 router = APIRouter()
 
 IMAGINE_SESSION_TTL = 600
+_IMAGINE_QUALITY_VALUES = {"standard", "hd"}
 _IMAGINE_SESSIONS: dict[str, dict] = {}
 _IMAGINE_SESSIONS_LOCK = asyncio.Lock()
 
@@ -65,7 +66,19 @@ def _parse_sse_chunk(chunk: str) -> Optional[Dict[str, Any]]:
     return payload
 
 
-async def _new_session(prompt: str, aspect_ratio: str, nsfw: Optional[bool]) -> str:
+def _normalize_quality(value: Optional[str]) -> str:
+    quality = str(value or "standard").strip().lower()
+    if quality not in _IMAGINE_QUALITY_VALUES:
+        raise HTTPException(status_code=400, detail="quality must be one of ['hd', 'standard']")
+    return quality
+
+
+async def _new_session(
+    prompt: str,
+    aspect_ratio: str,
+    nsfw: Optional[bool],
+    quality: str,
+) -> str:
     task_id = uuid.uuid4().hex
     now = time.time()
     async with _IMAGINE_SESSIONS_LOCK:
@@ -74,6 +87,7 @@ async def _new_session(prompt: str, aspect_ratio: str, nsfw: Optional[bool]) -> 
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,
             "nsfw": nsfw,
+            "quality": quality,
             "created_at": now,
         }
     return task_id
@@ -160,8 +174,8 @@ async def function_imagine_ws(websocket: WebSocket):
         run_task = None
         stop_event.clear()
 
-    async def _run(prompt: str, aspect_ratio: str, nsfw: Optional[bool]):
-        model_id = "grok-imagine-1.0"
+    async def _run(prompt: str, aspect_ratio: str, nsfw: Optional[bool], quality: str):
+        model_id = "imagine-x-1"
         model_info = ModelService.get(model_id)
         if not model_info or not model_info.is_image:
             await _send(
@@ -183,6 +197,7 @@ async def function_imagine_ws(websocket: WebSocket):
                 "prompt": prompt,
                 "aspect_ratio": aspect_ratio,
                 "run_id": run_id,
+                "quality": quality,
             }
         )
 
@@ -219,6 +234,7 @@ async def function_imagine_ws(websocket: WebSocket):
                     aspect_ratio=aspect_ratio,
                     stream=True,
                     enable_nsfw=nsfw,
+                    quality=quality,
                 )
                 if result.stream:
                     async for chunk in result.data:
@@ -299,11 +315,12 @@ async def function_imagine_ws(websocket: WebSocket):
                 aspect_ratio = resolve_aspect_ratio(
                     str(payload.get("aspect_ratio") or "2:3").strip() or "2:3"
                 )
+                quality = _normalize_quality(payload.get("quality"))
                 nsfw = payload.get("nsfw")
                 if nsfw is not None:
                     nsfw = bool(nsfw)
                 await _stop_run()
-                run_task = asyncio.create_task(_run(prompt, aspect_ratio, nsfw))
+                run_task = asyncio.create_task(_run(prompt, aspect_ratio, nsfw, quality))
             elif action == "stop":
                 await _stop_run()
             else:
@@ -338,6 +355,7 @@ async def function_imagine_sse(
     task_id: str = Query(""),
     prompt: str = Query(""),
     aspect_ratio: str = Query("2:3"),
+    quality: str = Query("standard"),
 ):
     """Imagine 图片瀑布流（SSE 兜底）"""
     session = None
@@ -360,19 +378,21 @@ async def function_imagine_sse(
         prompt = str(session.get("prompt") or "").strip()
         ratio = str(session.get("aspect_ratio") or "2:3").strip() or "2:3"
         nsfw = session.get("nsfw")
+        sse_quality = str(session.get("quality") or "standard").strip().lower()
     else:
         prompt = (prompt or "").strip()
         if not prompt:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
         ratio = str(aspect_ratio or "2:3").strip() or "2:3"
         ratio = resolve_aspect_ratio(ratio)
+        sse_quality = _normalize_quality(quality)
         nsfw = request.query_params.get("nsfw")
         if nsfw is not None:
             nsfw = str(nsfw).lower() in ("1", "true", "yes", "on")
 
     async def event_stream():
         try:
-            model_id = "grok-imagine-1.0"
+            model_id = "imagine-x-1"
             model_info = ModelService.get(model_id)
             if not model_info or not model_info.is_image:
                 yield (
@@ -424,6 +444,7 @@ async def function_imagine_sse(
                         aspect_ratio=ratio,
                         stream=True,
                         enable_nsfw=nsfw,
+                        quality=sse_quality,
                     )
                     if result.stream:
                         async for chunk in result.data:
@@ -487,6 +508,7 @@ class ImagineStartRequest(BaseModel):
     prompt: str
     aspect_ratio: Optional[str] = "2:3"
     nsfw: Optional[bool] = None
+    quality: Optional[str] = "standard"
 
 
 @router.post("/imagine/start", dependencies=[Depends(verify_function_key)])
@@ -495,8 +517,9 @@ async def function_imagine_start(data: ImagineStartRequest):
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
     ratio = resolve_aspect_ratio(str(data.aspect_ratio or "2:3").strip() or "2:3")
-    task_id = await _new_session(prompt, ratio, data.nsfw)
-    return {"task_id": task_id, "aspect_ratio": ratio}
+    q = _normalize_quality(data.quality)
+    task_id = await _new_session(prompt, ratio, data.nsfw, q)
+    return {"task_id": task_id, "aspect_ratio": ratio, "quality": q}
 
 
 class ImagineStopRequest(BaseModel):

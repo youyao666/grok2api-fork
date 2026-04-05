@@ -123,10 +123,12 @@ docker compose up -d
 | `grok-4.1-expert` | 4 | Basic/Super | 支持 | 支持 | - |
 | `grok-4.1-thinking` | 4 | Basic/Super | 支持 | 支持 | - |
 | `grok-4.20-beta` | 1 | Basic/Super | 支持 | 支持 | - |
-| `grok-imagine-1.0` | - | Basic/Super | - | 支持 | - |
+| `imagine-x-1` | - | Basic/Super | - | 支持 | - |
 | `grok-imagine-1.0-fast` | - | Basic/Super | - | 支持 | - |
 | `grok-imagine-1.0-edit` | - | Basic/Super | - | 支持 | - |
-| `grok-imagine-1.0-video` | - | Basic/Super | - | - | 支持 |
+| `grok-3` / `grok-imagine-video` / `grok-imagine-1.0-video` | - | Basic/Super | - | - | 支持 |
+
+> 视频生成接口当前兼容 `grok-3`、`grok-imagine-video` 与 `grok-imagine-1.0-video` 三种写法；实际发往 grok.com 网页视频链路的生成请求会使用 `grok-3 + toolOverrides.videoGen=true`。
 
 <br>
 
@@ -164,12 +166,12 @@ curl http://localhost:8000/v1/chat/completions \
 | `tools` | array | 工具定义 | OpenAI function tools |
 | `tool_choice` | string/object | 工具选择 | `auto`, `required`, `none` 或指定工具 |
 | `parallel_tool_calls` | boolean | 是否允许并行工具调用 | `true`, `false` |
-| `video_config` | object | **视频模型专用配置对象** | 支持：`grok-imagine-1.0-video` |
+| `video_config` | object | **视频模型专用配置对象** | 支持：`grok-3` / `grok-imagine-video` / `grok-imagine-1.0-video` |
 | └─`aspect_ratio` | string | 视频宽高比 | `16:9`, `9:16`, `1:1`, `2:3`, `3:2`, `1280x720`, `720x1280`, `1792x1024`, `1024x1792`, `1024x1024` |
 | └─`video_length` | integer | 视频时长 (秒) | `6` ~ `30` |
 | └─`resolution_name` | string | 分辨率 | `480p`, `720p` |
 | └─`preset` | string | 风格预设 | `fun`, `normal`, `spicy`, `custom` |
-| `image_config` | object | **图片模型专用配置对象** | 支持：`grok-imagine-1.0` / `grok-imagine-1.0-fast` / `grok-imagine-1.0-edit` |
+| `image_config` | object | **图片模型专用配置对象** | 支持：`imagine-x-1` / `grok-imagine-1.0-edit` |
 | └─`n` | integer | 生成数量 | `1` ~ `10` |
 | └─`size` | string | 图片尺寸 | `1280x720`, `720x1280`, `1792x1024`, `1024x1792`, `1024x1024` |
 | └─`response_format` | string | 响应格式 | `url`, `b64_json`, `base64` |
@@ -200,7 +202,9 @@ curl http://localhost:8000/v1/chat/completions \
 - `grok-imagine-1.0-fast` 流式 URL 出图会保持原始图片名（不追加 `-final` 后缀）。
 - 当图片疑似被审查拦截导致无最终图时，若开启 `image.blocked_parallel_enabled`，服务端会按 `image.blocked_parallel_attempts` 自动并行补偿生成，并优先使用不同 token；若仍无满足 `image.final_min_bytes` 的最终图则返回失败。
 - `grok-imagine-1.0-edit` 必须提供图片，多图默认取**最后 3 张**与最后一个文本。
-- `grok-imagine-1.0-video` 支持文生视频与多图参考视频：可通过多个 `image_url` 传最多 `7` 张参考图，并在文本中使用 `@图1`、`@图2` 这类占位符；服务端会自动替换为对应 `assetId`。
+- `grok-3` / `grok-imagine-video` / `grok-imagine-1.0-video` 均可用于视频生成；兼容别名最终会统一路由到 grok.com 网页视频链路（`modelName=grok-3` + `toolOverrides.videoGen=true`）。
+- 视频生成支持文生视频与多图参考视频：可通过多个 `image_url` 传最多 `7` 张参考图，并在文本中使用 `@图1`、`@图2` 这类占位符；服务端会自动替换为对应 `assetId`。
+- 仅图生视频时文本提示词可以为空；若未提供任何参考图，则必须提供 `prompt`。
 - `@图N` 与 `image_url` 的顺序一一对应；若引用了不存在的图片序号，会直接报错。
 - 除上述外的其他参数将自动丢弃并忽略。
 
@@ -259,12 +263,14 @@ curl http://localhost:8000/v1/responses \
 
 > 图像生成接口
 
+> 当前仅支持 `imagine-x-1` 作为图像生成模型。
+
 ```bash
 curl http://localhost:8000/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $GROK2API_API_KEY" \
   -d '{
-    "model": "grok-imagine-1.0",
+    "model": "imagine-x-1",
     "prompt": "一只在太空漂浮的猫",
     "n": 1
   }'
@@ -277,7 +283,7 @@ curl http://localhost:8000/v1/images/generations \
 
 | 字段 | 类型 | 说明 | 可用参数 |
 | :-- | :-- | :-- | :-- |
-| `model` | string | 图像模型名 | `grok-imagine-1.0` |
+| `model` | string | 图像模型名 | `imagine-x-1` |
 | `prompt` | string | 图像描述提示词 | - |
 | `n` | integer | 生成数量 | `1` - `10` (流式模式仅限 `1` 或 `2`) |
 | `stream` | boolean | 是否开启流式输出 | `true`, `false` |
@@ -346,7 +352,7 @@ curl http://localhost:8000/v1/videos \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $GROK2API_API_KEY" \
   -d '{
-    "model": "grok-imagine-1.0-video",
+    "model": "grok-3",
     "prompt": "霓虹雨夜街头，慢镜头追拍",
     "size": "1792x1024",
     "seconds": 18,
@@ -361,7 +367,7 @@ curl http://localhost:8000/v1/videos \
 
 | 字段 | 类型 | 说明 | 可用参数 |
 | :-- | :-- | :-- | :-- |
-| `model` | string | 视频模型名 | `grok-imagine-1.0-video` |
+| `model` | string | 视频模型名 | `grok-3`, `grok-imagine-video`, `grok-imagine-1.0-video` |
 | `prompt` | string | 视频提示词 | - |
 | `size` | string | 画面比例（会映射到 aspect_ratio） | `1280x720`, `720x1280`, `1792x1024`, `1024x1792`, `1024x1024` |
 | `seconds` | integer | 目标时长（秒） | `6` ~ `30` |
@@ -374,7 +380,9 @@ curl http://localhost:8000/v1/videos \
 - 服务端已支持 6~30 秒自动链式扩展，**无需使用 `/v1/video/extend`**。
 - `quality=standard` 对应 `480p`；`quality=high` 对应 `720p`。
 - 基础号池请求 `720p` 时会先产出 `480p` 再按 `video.upscale_timing` 执行超分。
+- 推荐优先使用 `model=grok-3`；`grok-imagine-video` 与 `grok-imagine-1.0-video` 作为兼容别名保留。
 - `image_reference` 统一使用数组格式，最多可传 7 张参考图；单图场景也请传单元素数组。`input_reference` 主要以表单上传参考图；若两者同时传入，会按顺序作为参考图合并输入；可在提示词中使用 `@图1`、`@图2`。
+- 仅图生视频时 `prompt` 可为空；若没有任何参考图，则 `prompt` 必填。
 
 <br>
 

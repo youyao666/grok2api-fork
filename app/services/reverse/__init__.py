@@ -1,6 +1,7 @@
 """Reverse interfaces for Grok endpoints."""
 
 from .app_chat import AppChatReverse
+from .assets_detail import AssetsDetailReverse
 from .assets_delete import AssetsDeleteReverse
 from .assets_download import AssetsDownloadReverse
 from .assets_list import AssetsListReverse
@@ -17,6 +18,7 @@ from .utils.statsig import StatsigGenerator
 
 __all__ = [
     "AppChatReverse",
+    "AssetsDetailReverse",
     "AssetsDeleteReverse",
     "AssetsDownloadReverse",
     "AssetsListReverse",

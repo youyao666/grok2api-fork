@@ -1,12 +1,13 @@
+# ============================================================
+#  Stage 1 — builder: install Python deps via uv
+# ============================================================
 FROM python:3.13-alpine AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai \
-    # 把 uv 包安装到系统 Python 环境
     UV_PROJECT_ENVIRONMENT=/opt/venv
 
-# 确保 uv 的 bin 目录
 ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 
 RUN apk add --no-cache \
@@ -22,7 +23,6 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-# 安装 uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 COPY pyproject.toml uv.lock ./
@@ -36,7 +36,13 @@ RUN uv sync --frozen --no-dev --no-install-project \
     && find /opt/venv -type f -name "*.so" -exec strip --strip-unneeded {} + || true \
     && rm -rf /root/.cache /tmp/uv-cache
 
+# ============================================================
+#  Stage 2 — runtime: lean production image
+# ============================================================
 FROM python:3.13-alpine
+
+LABEL maintainer="chenyme" \
+      description="Grok2API - OpenAI-compatible Grok reverse proxy"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -55,7 +61,11 @@ RUN apk add --no-cache \
     openssl \
     libgcc \
     libstdc++ \
-    libcurl
+    libcurl \
+    tini \
+    curl \
+    && addgroup -S appgrp \
+    && adduser -S appusr -G appgrp
 
 WORKDIR /app
 
@@ -68,10 +78,15 @@ COPY main.py ./
 COPY scripts ./scripts
 
 RUN mkdir -p /app/data /app/logs \
-    && chmod +x /app/scripts/entrypoint.sh
+    && chown -R appusr:appgrp /app/data /app/logs \
+    && chmod +x /app/scripts/entrypoint.sh \
+    && sed -i 's/\r$//' /app/scripts/*.sh
 
 EXPOSE 8000
 
-ENTRYPOINT ["/app/scripts/entrypoint.sh"]
+USER appusr
+
+# tini 作为 PID 1，正确处理信号转发
+ENTRYPOINT ["tini", "--", "/app/scripts/entrypoint.sh"]
 
 CMD ["sh", "-c", "granian --interface asgi --host ${SERVER_HOST:-0.0.0.0} --port ${SERVER_PORT:-8000} --workers ${SERVER_WORKERS:-1} main:app"]

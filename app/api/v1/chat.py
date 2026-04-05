@@ -49,6 +49,7 @@ class ImageConfig(BaseModel):
     n: Optional[int] = Field(1, ge=1, le=10, description="生成数量 (1-10)")
     size: Optional[str] = Field("1024x1024", description="图片尺寸")
     response_format: Optional[str] = Field(None, description="响应格式")
+    quality: Optional[str] = Field("standard", description="图片质量 (standard/hd)")
 
 
 class ChatCompletionRequest(BaseModel):
@@ -194,7 +195,8 @@ def _imagine_fast_server_image_config() -> ImageConfig:
         get_config("imagine_fast.response_format", get_config("app.image_format") or "url")
         or "url"
     )
-    return ImageConfig(n=n, size=size, response_format=response_format)
+    quality = str(get_config("imagine_fast.quality", "standard") or "standard")
+    return ImageConfig(n=n, size=size, response_format=response_format, quality=quality)
 
 
 async def _safe_sse_stream(stream: AsyncIterable[str]) -> AsyncGenerator[str, None]:
@@ -280,6 +282,15 @@ def _validate_image_config(image_conf: ImageConfig, *, stream: bool):
             param="image_config.size",
             code="invalid_size",
         )
+    quality = str(image_conf.quality or "standard").strip().lower()
+    if quality not in {"standard", "hd"}:
+        raise ValidationException(
+            message="quality must be one of ['hd', 'standard']",
+            param="image_config.quality",
+            code="invalid_quality",
+        )
+    image_conf.quality = quality
+
 def validate_request(request: ChatCompletionRequest):
     """验证请求参数"""
     # 验证模型
@@ -817,6 +828,7 @@ async def chat_completions(request: ChatCompletionRequest):
             size=size,
             aspect_ratio=aspect_ratio,
             stream=bool(is_stream),
+            quality=image_conf.quality or "standard",
             chat_format=True,
         )
 

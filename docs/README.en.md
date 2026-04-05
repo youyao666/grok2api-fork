@@ -120,10 +120,12 @@ docker compose up -d
 | `grok-4.1-expert` | 4 | Basic/Super | Yes | Yes | - |
 | `grok-4.1-thinking` | 4 | Basic/Super | Yes | Yes | - |
 | `grok-4.20-beta` | 1 | Basic/Super | Yes | Yes | - |
-| `grok-imagine-1.0` | - | Basic/Super | - | Yes | - |
+| `imagine-x-1` | - | Basic/Super | - | Yes | - |
 | `grok-imagine-1.0-fast` | - | Basic/Super | - | Yes | - |
 | `grok-imagine-1.0-edit` | - | Basic/Super | - | Yes | - |
-| `grok-imagine-1.0-video` | - | Basic/Super | - | - | Yes |
+| `grok-3` / `grok-imagine-video` / `grok-imagine-1.0-video` | - | Basic/Super | - | - | Yes |
+
+> The video endpoints currently accept `grok-3`, `grok-imagine-video`, and `grok-imagine-1.0-video`; the actual grok.com web video request is routed as `grok-3 + toolOverrides.videoGen=true`.
 
 <br>
 
@@ -161,12 +163,12 @@ curl http://localhost:8000/v1/chat/completions \
 | `tools` | array | Tool definitions | OpenAI function tools |
 | `tool_choice` | string/object | Tool choice | `auto`, `required`, `none`, or a specific tool |
 | `parallel_tool_calls` | boolean | Allow parallel tool calls | `true`, `false` |
-| `video_config` | object | **Video model only** | Supported: `grok-imagine-1.0-video` |
+| `video_config` | object | **Video model only** | Supported: `grok-3` / `grok-imagine-video` / `grok-imagine-1.0-video` |
 | └─ `aspect_ratio` | string | Video aspect ratio | `16:9`, `9:16`, `1:1`, `2:3`, `3:2`, `1280x720`, `720x1280`, `1792x1024`, `1024x1792`, `1024x1024` |
 | └─ `video_length` | integer | Video length (seconds) | `6` ~ `30` |
 | └─ `resolution_name` | string | Resolution | `480p`, `720p` |
 | └─ `preset` | string | Style preset | `fun`, `normal`, `spicy`, `custom` |
-| `image_config` | object | **Image models only** | Supported: `grok-imagine-1.0` / `grok-imagine-1.0-fast` / `grok-imagine-1.0-edit` |
+| `image_config` | object | **Image models only** | Supported: `imagine-x-1` / `grok-imagine-1.0-edit` |
 | └─ `n` | integer | Number of images | `1` ~ `10` |
 | └─ `size` | string | Image size | `1280x720`, `720x1280`, `1792x1024`, `1024x1792`, `1024x1024` |
 | └─ `response_format` | string | Response format | `url`, `b64_json`, `base64` |
@@ -196,7 +198,9 @@ curl http://localhost:8000/v1/chat/completions \
 - `grok-imagine-1.0-fast` streaming output in `/chat/completions` only returns the final image, hiding intermediate preview images.
 - `grok-imagine-1.0-fast` streaming URL output will retain the original image filename (without appending `-final`).
 - `grok-imagine-1.0-edit` requires an image; if multiple are provided, the **last 3** images and last text are used.
-- `grok-imagine-1.0-video` supports text-to-video and multi-image reference video: pass up to `7` `image_url` blocks and use placeholders like `@图1`, `@图2` in the prompt; the server will replace them with the corresponding `assetId` values.
+- `grok-3`, `grok-imagine-video`, and `grok-imagine-1.0-video` can all be used for video generation; compatibility aliases are ultimately routed to the grok.com web video path (`modelName=grok-3` + `toolOverrides.videoGen=true`).
+- Video generation supports both text-to-video and multi-image reference video: pass up to `7` `image_url` blocks and use placeholders like `@图1`, `@图2` in the prompt; the server will replace them with the corresponding `assetId` values.
+- For pure image-to-video requests, `prompt` may be empty. If you do not provide any reference image, `prompt` is required.
 - `@图N` placeholders map to `image_url` order; referencing a missing image index returns an error.
 - Any other parameters will be discarded and ignored.
 
@@ -255,12 +259,14 @@ curl http://localhost:8000/v1/responses \
 
 > Image generation endpoint
 
+> This endpoint currently supports only `imagine-x-1` for image generation.
+
 ```bash
 curl http://localhost:8000/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $GROK2API_API_KEY" \
   -d '{
-    "model": "grok-imagine-1.0",
+    "model": "imagine-x-1",
     "prompt": "A cat floating in space",
     "n": 1
   }'
@@ -273,7 +279,7 @@ curl http://localhost:8000/v1/images/generations \
 
 | Field | Type | Description | Allowed values |
 | :-- | :-- | :-- | :-- |
-| `model` | string | Image model ID | `grok-imagine-1.0` |
+| `model` | string | Image model ID | `imagine-x-1` |
 | `prompt` | string | Prompt | - |
 | `n` | integer | Number of images | `1` - `10` (streaming: `1` or `2` only) |
 | `stream` | boolean | Enable streaming | `true`, `false` |
@@ -342,7 +348,7 @@ curl http://localhost:8000/v1/videos \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $GROK2API_API_KEY" \
   -d '{
-    "model": "grok-imagine-1.0-video",
+    "model": "grok-3",
     "prompt": "Neon rainy street at night, cinematic slow tracking shot",
     "size": "1792x1024",
     "seconds": 18,
@@ -357,7 +363,7 @@ curl http://localhost:8000/v1/videos \
 
 | Field | Type | Description | Allowed values |
 | :-- | :-- | :-- | :-- |
-| `model` | string | Video model | `grok-imagine-1.0-video` |
+| `model` | string | Video model | `grok-3`, `grok-imagine-video`, `grok-imagine-1.0-video` |
 | `prompt` | string | Video prompt | - |
 | `size` | string | Frame size (mapped to aspect_ratio) | `1280x720`, `720x1280`, `1792x1024`, `1024x1792`, `1024x1024` |
 | `seconds` | integer | Target duration (seconds) | `6` ~ `30` |
@@ -370,7 +376,9 @@ curl http://localhost:8000/v1/videos \
 - Server-side chain extension now supports 6~30 seconds automatically, so **`/v1/video/extend` is not required**.
 - `quality=standard` maps to `480p`; `quality=high` maps to `720p`.
 - For basic-pool requests at `720p`, generation falls back to `480p` first, then upscales according to `video.upscale_timing`.
+- Prefer `model=grok-3`; `grok-imagine-video` and `grok-imagine-1.0-video` remain as compatibility aliases.
 - `image_reference` now uses array format only and supports up to 7 images; single-image requests should also use a one-item array. If both `image_reference` and `input_reference` are provided, references are processed and merged in order; you can use placeholders like `@图1`, `@图2` in prompts.
+- For pure image-to-video requests, `prompt` may be empty. If no reference image is provided, `prompt` is required.
 
 <br>
 

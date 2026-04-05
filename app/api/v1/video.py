@@ -23,6 +23,11 @@ from app.services.grok.services.video_extend import VideoExtendService
 router = APIRouter(tags=["Videos"])
 
 VIDEO_MODEL_ID = "grok-imagine-1.0-video"
+VIDEO_MODEL_ALIASES = {
+    VIDEO_MODEL_ID,
+    "grok-imagine-video",
+    "grok-3",
+}
 SIZE_TO_ASPECT = {
     "1280x720": "16:9",
     "720x1280": "9:16",
@@ -41,7 +46,7 @@ class VideoCreateRequest(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    prompt: str = Field(..., description="Video prompt")
+    prompt: Optional[str] = Field("", description="Video prompt")
     model: Optional[str] = Field(VIDEO_MODEL_ID, description="Model id")
     size: Optional[str] = Field("1792x1024", description="Output size")
     seconds: Optional[int] = Field(6, description="Video length in seconds")
@@ -107,13 +112,21 @@ def _extract_video_url(content: str) -> str:
 
 def _normalize_model(model: Optional[str]) -> str:
     requested = (model or VIDEO_MODEL_ID).strip()
-    if requested != VIDEO_MODEL_ID:
+    if requested not in VIDEO_MODEL_ALIASES:
         raise ValidationException(
-            message=f"The model `{VIDEO_MODEL_ID}` is required for video generation.",
+            message=(
+                "The model for video generation must be one of "
+                f"{sorted(VIDEO_MODEL_ALIASES)}."
+            ),
             param="model",
             code="model_not_supported",
         )
     model_info = ModelService.get(requested)
+    # grok.com web currently sends video generation through app-chat with
+    # modelName=grok-3 plus toolOverrides.videoGen=true, so allow that input
+    # here without requiring the chat model itself to be flagged as is_video.
+    if requested == "grok-3":
+        return requested
     if not model_info or not model_info.is_video:
         raise ValidationException(
             message=f"The model `{requested}` is not supported for video generation.",
@@ -337,7 +350,6 @@ async def _build_payload_and_references_for_form(
 def _multipart_create_schema(default_seconds: int) -> Dict[str, Any]:
     return {
         "type": "object",
-        "required": ["prompt"],
         "properties": {
             "prompt": {"type": "string"},
             "model": {"type": "string", "default": VIDEO_MODEL_ID},
@@ -385,9 +397,9 @@ async def _create_video_from_payload(
     require_extension: bool = False,
 ) -> JSONResponse:
     prompt = (payload.prompt or "").strip()
-    if not prompt:
+    if not prompt and not references:
         raise ValidationException(
-            message="prompt is required",
+            message="prompt is required when no image_reference or input_reference is provided",
             param="prompt",
             code="invalid_request_error",
         )
@@ -403,7 +415,9 @@ async def _create_video_from_payload(
             code="invalid_seconds",
         )
 
-    content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+    content: List[Dict[str, Any]] = []
+    if prompt:
+        content.append({"type": "text", "text": prompt})
     for ref in references:
         content.append({"type": "image_url", "image_url": {"url": ref}})
 

@@ -116,6 +116,11 @@ class AppChatReverse:
     }
 
     @staticmethod
+    def _preserve_model_name(model: str) -> bool:
+        """Keep modelName/modelMode for newer image models until their mode mapping is confirmed."""
+        return isinstance(model, str) and model.startswith("imagine-")
+
+    @staticmethod
     def build_payload(
         message: str,
         model: str,
@@ -124,10 +129,36 @@ class AppChatReverse:
         tool_overrides: Dict[str, Any] = None,
         model_config_override: Dict[str, Any] = None,
         request_overrides: Dict[str, Any] = None,
+        minimal_payload: bool = False,
     ) -> Dict[str, Any]:
         """Build chat payload for Grok app-chat API."""
 
         attachments = file_attachments or []
+
+        if minimal_payload:
+            payload: Dict[str, Any] = {
+                "temporary": bool(get_config("app.temporary")),
+                "modelName": model,
+                "message": message,
+                "fileAttachments": attachments,
+                "toolOverrides": tool_overrides or {},
+                "enableSideBySide": True,
+            }
+            response_metadata: Dict[str, Any] = {"experiments": []}
+            if model_config_override:
+                response_metadata["modelConfigOverride"] = model_config_override
+            if response_metadata:
+                payload["responseMetadata"] = response_metadata
+
+            if request_overrides:
+                payload.update(
+                    {k: v for k, v in request_overrides.items() if v is not None}
+                )
+
+            logger.debug(
+                f"AppChatReverse payload: {orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode()}"
+            )
+            return payload
 
         payload = {
             "deviceEnvInfo": {
@@ -168,7 +199,7 @@ class AppChatReverse:
         # 优先使用 modeId（Grok 新 API 格式，付费号多智能体模式必需）
         # 有 modeId 时移除 modelName/modelMode（浏览器前端逻辑）
         mode_id = AppChatReverse._MODE_ID_MAP.get(mode)
-        if mode_id:
+        if mode_id and not AppChatReverse._preserve_model_name(model):
             payload["modeId"] = mode_id
             payload.pop("modelName", None)
             payload.pop("modelMode", None)
@@ -199,6 +230,7 @@ class AppChatReverse:
         tool_overrides: Dict[str, Any] = None,
         model_config_override: Dict[str, Any] = None,
         request_overrides: Dict[str, Any] = None,
+        minimal_payload: bool = False,
     ) -> Any:
         """Send app chat request to Grok.
         
@@ -232,11 +264,18 @@ class AppChatReverse:
             else:
                 _log_proxy_state_once("")
             # Build headers
+            referer = get_config("app.app_url") or "https://grok.com/"
+            parsed_referer = urlparse(referer)
+            origin = (
+                f"{parsed_referer.scheme}://{parsed_referer.netloc}"
+                if parsed_referer.scheme and parsed_referer.netloc
+                else "https://grok.com"
+            )
             headers = build_headers(
                 cookie_token=token,
                 content_type="application/json",
-                origin="https://grok.com",
-                referer="https://grok.com/",
+                origin=origin,
+                referer=referer,
             )
 
             # Build payload
@@ -248,6 +287,7 @@ class AppChatReverse:
                 tool_overrides=tool_overrides,
                 model_config_override=model_config_override,
                 request_overrides=request_overrides,
+                minimal_payload=minimal_payload,
             )
             payload_summary = {
                 "model": payload.get("modelName"),

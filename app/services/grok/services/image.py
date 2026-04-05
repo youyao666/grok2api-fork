@@ -43,6 +43,10 @@ class ImageGenerationService:
     """Image generation orchestration service."""
 
     @staticmethod
+    def _prefers_new_ws(model_info: Any) -> bool:
+        return getattr(model_info, "model_id", "") == "imagine-x-1"
+
+    @staticmethod
     def _app_chat_request_overrides(
         count: int,
         enable_nsfw: Optional[bool],
@@ -67,6 +71,7 @@ class ImageGenerationService:
         aspect_ratio: str,
         stream: bool,
         enable_nsfw: Optional[bool] = None,
+        quality: str = "standard",
         chat_format: bool = False,
     ) -> ImageGenerationResult:
         max_token_retries = int(get_config("retry.max_retry") or 3)
@@ -104,24 +109,7 @@ class ImageGenerationService:
                     tried_tokens.add(current_token)
                     yielded = False
                     try:
-                        try:
-                            result = await self._stream_app_chat(
-                                token_mgr=token_mgr,
-                                token=current_token,
-                                model_info=model_info,
-                                prompt=prompt,
-                                n=n,
-                                response_format=response_format,
-                                enable_nsfw=enable_nsfw,
-                                chat_format=chat_format,
-                            )
-                        except UpstreamException as app_chat_error:
-                            if rate_limited(app_chat_error):
-                                raise
-                            logger.warning(
-                                "App-chat image stream failed, falling back to ws_imagine: %s",
-                                app_chat_error,
-                            )
+                        if self._prefers_new_ws(model_info):
                             result = await self._stream_ws(
                                 token_mgr=token_mgr,
                                 token=current_token,
@@ -131,6 +119,18 @@ class ImageGenerationService:
                                 response_format=response_format,
                                 size=size,
                                 aspect_ratio=aspect_ratio,
+                                enable_nsfw=enable_nsfw,
+                                quality=quality,
+                                chat_format=chat_format,
+                            )
+                        else:
+                            result = await self._stream_app_chat(
+                                token_mgr=token_mgr,
+                                token=current_token,
+                                model_info=model_info,
+                                prompt=prompt,
+                                n=n,
+                                response_format=response_format,
                                 enable_nsfw=enable_nsfw,
                                 chat_format=chat_format,
                             )
@@ -183,23 +183,7 @@ class ImageGenerationService:
 
             tried_tokens.add(current_token)
             try:
-                try:
-                    return await self._collect_app_chat(
-                        token_mgr=token_mgr,
-                        token=current_token,
-                        model_info=model_info,
-                        prompt=prompt,
-                        n=n,
-                        response_format=response_format,
-                        enable_nsfw=enable_nsfw,
-                    )
-                except UpstreamException as app_chat_error:
-                    if rate_limited(app_chat_error):
-                        raise
-                    logger.warning(
-                        "App-chat image collect failed, falling back to ws_imagine: %s",
-                        app_chat_error,
-                    )
+                if self._prefers_new_ws(model_info):
                     return await self._collect_ws(
                         token_mgr=token_mgr,
                         token=current_token,
@@ -210,7 +194,17 @@ class ImageGenerationService:
                         response_format=response_format,
                         aspect_ratio=aspect_ratio,
                         enable_nsfw=enable_nsfw,
+                        quality=quality,
                     )
+                return await self._collect_app_chat(
+                    token_mgr=token_mgr,
+                    token=current_token,
+                    model_info=model_info,
+                    prompt=prompt,
+                    n=n,
+                    response_format=response_format,
+                    enable_nsfw=enable_nsfw,
+                )
             except UpstreamException as e:
                 last_error = e
                 if rate_limited(e):
@@ -243,6 +237,7 @@ class ImageGenerationService:
         size: str,
         aspect_ratio: str,
         enable_nsfw: Optional[bool] = None,
+        quality: str = "standard",
         chat_format: bool = False,
     ) -> ImageGenerationResult:
         if enable_nsfw is None:
@@ -255,6 +250,8 @@ class ImageGenerationService:
             aspect_ratio=aspect_ratio,
             n=n,
             enable_nsfw=enable_nsfw,
+            quality=quality,
+            model=model_info.model_id,
             max_retries=stream_retries,
         )
         processor = ImageWSStreamProcessor(
@@ -404,6 +401,7 @@ class ImageGenerationService:
         response_format: str,
         aspect_ratio: str,
         enable_nsfw: Optional[bool] = None,
+        quality: str = "standard",
     ) -> ImageGenerationResult:
         if enable_nsfw is None:
             enable_nsfw = bool(get_config("image.nsfw"))
@@ -422,6 +420,8 @@ class ImageGenerationService:
                 aspect_ratio=aspect_ratio,
                 n=call_target,
                 enable_nsfw=enable_nsfw,
+                quality=quality,
+                model=model_info.model_id,
                 max_retries=stream_retries,
             )
             processor = ImageWSCollectProcessor(
@@ -580,6 +580,17 @@ class ImageWSBaseProcessor(BaseProcessor):
             self.response_field = "b64_json"
         self._image_dir: Optional[Path] = None
 
+    def _uses_job_identity(self) -> bool:
+        return self.model == "imagine-x-1"
+
+    def _item_identity(self, item: Dict) -> str:
+        if self._uses_job_identity():
+            return item.get("job_key") or item.get("job_id") or item.get("image_id") or ""
+        return item.get("image_id", "")
+
+    def _storage_image_id(self, item: Dict, identity: str) -> str:
+        return item.get("image_id") or identity
+
     def _ensure_image_dir(self) -> Path:
         if self._image_dir is None:
             base_dir = DATA_DIR / "tmp" / "image"
@@ -648,9 +659,15 @@ class ImageWSBaseProcessor(BaseProcessor):
     def _pick_best(self, existing: Optional[Dict], incoming: Dict) -> Dict:
         if not existing:
             return incoming
+        existing_completed = bool(existing.get("job_completed"))
+        incoming_completed = bool(incoming.get("job_completed"))
         if incoming.get("is_final") and not existing.get("is_final"):
             return incoming
         if existing.get("is_final") and not incoming.get("is_final"):
+            return existing
+        if incoming_completed and not existing_completed:
+            return incoming
+        if existing_completed and not incoming_completed:
             return existing
         if incoming.get("blob_size", 0) > existing.get("blob_size", 0):
             return incoming
@@ -707,6 +724,7 @@ class ImageWSStreamProcessor(ImageWSBaseProcessor):
 
     async def process(self, response: AsyncIterable[dict]) -> AsyncGenerator[str, None]:
         images: Dict[str, Dict] = {}
+        completed_jobs: set[str] = set()
         emitted_chat_chunk = False
 
         async for item in response:
@@ -727,21 +745,32 @@ class ImageWSStreamProcessor(ImageWSBaseProcessor):
                     },
                 )
                 return
+            if item.get("type") == "job":
+                if item.get("state") == "completed":
+                    identity = item.get("job_key") or item.get("job_id") or item.get("image_id")
+                    if identity:
+                        completed_jobs.add(identity)
+                        if identity in images:
+                            images[identity]["job_completed"] = True
+                continue
             if item.get("type") != "image":
                 continue
 
-            image_id = item.get("image_id")
-            if not image_id:
+            identity = self._item_identity(item)
+            if not identity:
                 continue
+            storage_image_id = self._storage_image_id(item, identity)
+            item = dict(item)
+            item["job_completed"] = identity in completed_jobs
 
             if self.n == 1:
                 if self._target_id is None:
-                    self._target_id = image_id
-                index = 0 if image_id == self._target_id else None
+                    self._target_id = identity
+                index = 0 if identity == self._target_id else None
             else:
-                index = self._assign_index(image_id)
+                index = self._assign_index(identity)
 
-            images[image_id] = self._pick_best(images.get(image_id), item)
+            images[identity] = self._pick_best(images.get(identity), item)
 
             if index is None:
                 continue
@@ -750,26 +779,26 @@ class ImageWSStreamProcessor(ImageWSBaseProcessor):
                 # Chat Completions image stream should only expose final results.
                 if self.chat_format:
                     continue
-                if image_id not in self._initial_sent:
-                    self._initial_sent.add(image_id)
+                if identity not in self._initial_sent:
+                    self._initial_sent.add(identity)
                     stage = item.get("stage") or "preview"
                     if stage == "medium":
                         partial_index = 1
-                        self._partial_map[image_id] = 1
+                        self._partial_map[identity] = 1
                     else:
                         partial_index = 0
-                        self._partial_map[image_id] = 0
+                        self._partial_map[identity] = 0
                 else:
                     stage = item.get("stage") or "partial"
                     if stage == "preview":
                         continue
-                    partial_index = self._partial_map.get(image_id, 0)
+                    partial_index = self._partial_map.get(identity, 0)
                     if stage == "medium":
                         partial_index = max(partial_index, 1)
-                    self._partial_map[image_id] = partial_index
+                    self._partial_map[identity] = partial_index
 
                 if self.response_format == "url":
-                    partial_id = f"{image_id}-{stage}-{partial_index}"
+                    partial_id = f"{storage_image_id}-{stage}-{partial_index}"
                     partial_out = await self._save_blob(
                         partial_id,
                         item.get("blob", ""),
@@ -811,7 +840,7 @@ class ImageWSStreamProcessor(ImageWSBaseProcessor):
                             "size": self.size,
                             "index": index,
                             "partial_image_index": partial_index,
-                            "image_id": image_id,
+                            "image_id": storage_image_id,
                             "stage": stage,
                         },
                     )
@@ -834,17 +863,18 @@ class ImageWSStreamProcessor(ImageWSBaseProcessor):
                 selected = []
         else:
             selected = [
-                (image_id, images[image_id])
-                for image_id in self._index_map
-                if image_id in images and images[image_id].get("is_final", False)
+                (identity, images[identity])
+                for identity in self._index_map
+                if identity in images and images[identity].get("is_final", False)
             ]
 
-        for image_id, item in selected:
+        for identity, item in selected:
+            storage_image_id = self._storage_image_id(item, identity)
             if self.response_format == "url":
-                final_image_id = image_id
+                final_image_id = storage_image_id
                 # Keep original imagine image name for imagine chat stream output.
                 if self.model != "grok-imagine-1.0-fast":
-                    final_image_id = f"{image_id}-final"
+                    final_image_id = f"{storage_image_id}-final"
                 output = await self._save_blob(
                     final_image_id,
                     item.get("blob", ""),
@@ -854,7 +884,7 @@ class ImageWSStreamProcessor(ImageWSBaseProcessor):
                 if self.chat_format and output:
                     output = wrap_image_content(output, self.response_format)
             else:
-                output = await self._to_output(image_id, item)
+                output = await self._to_output(storage_image_id, item)
                 if self.chat_format and output:
                     output = wrap_image_content(output, self.response_format)
 
@@ -864,7 +894,7 @@ class ImageWSStreamProcessor(ImageWSBaseProcessor):
             if self.n == 1:
                 index = 0
             else:
-                index = self._index_map.get(image_id, 0)
+                index = self._index_map.get(identity, 0)
 
             if not self._id_generated:
                 self._response_id = make_response_id()
@@ -893,7 +923,7 @@ class ImageWSStreamProcessor(ImageWSBaseProcessor):
                         "created_at": int(time.time()),
                         "size": self.size,
                         "index": index,
-                        "image_id": image_id,
+                        "image_id": storage_image_id,
                         "stage": "final",
                         "usage": {
                             "total_tokens": 0,
@@ -933,29 +963,50 @@ class ImageWSCollectProcessor(ImageWSBaseProcessor):
 
     async def process(self, response: AsyncIterable[dict]) -> List[str]:
         images: Dict[str, Dict] = {}
+        completed_jobs: set[str] = set()
+        order_map: Dict[str, int] = {}
 
         async for item in response:
             if item.get("type") == "error":
                 message = item.get("error") or "Upstream error"
                 raise UpstreamException(message, details=item)
+            if item.get("type") == "job":
+                if item.get("state") == "completed":
+                    identity = item.get("job_key") or item.get("job_id") or item.get("image_id")
+                    if identity:
+                        completed_jobs.add(identity)
+                        if identity in images:
+                            images[identity]["job_completed"] = True
+                continue
             if item.get("type") != "image":
                 continue
-            image_id = item.get("image_id")
-            if not image_id:
+            identity = self._item_identity(item)
+            if not identity:
                 continue
-            images[image_id] = self._pick_best(images.get(image_id), item)
+            if identity not in order_map:
+                order_map[identity] = len(order_map)
+            item = dict(item)
+            item["job_completed"] = identity in completed_jobs
+            images[identity] = self._pick_best(images.get(identity), item)
 
-        selected = sorted(
-            [item for item in images.values() if item.get("is_final", False)],
-            key=lambda x: x.get("blob_size", 0),
-            reverse=True,
-        )
+        selected = [images[identity] for identity in sorted(order_map, key=order_map.get) if identity in images and images[identity].get("is_final", False)]
+        if self._uses_job_identity():
+            completed_selected = [item for item in selected if item.get("job_completed")]
+            if completed_selected:
+                selected = completed_selected
+        else:
+            selected = sorted(
+                selected,
+                key=lambda x: x.get("blob_size", 0),
+                reverse=True,
+            )
         if self.n:
             selected = selected[: self.n]
 
         results: List[str] = []
         for item in selected:
-            output = await self._to_output(item.get("image_id", ""), item)
+            storage_image_id = self._storage_image_id(item, self._item_identity(item))
+            output = await self._to_output(storage_image_id, item)
             if output:
                 results.append(output)
 

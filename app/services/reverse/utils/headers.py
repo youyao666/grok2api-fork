@@ -182,7 +182,7 @@ def _build_client_hints(browser: Optional[str], user_agent: Optional[str]) -> Di
     sec_ch_ua = (
         f"\"{brand}\";v=\"{version}\", "
         f"\"Chromium\";v=\"{version}\", "
-        "\"Not(A:Brand\";v=\"24\""
+        "\"Not_A Brand\";v=\"99\""
     )
 
     platform = _detect_platform(user_agent)

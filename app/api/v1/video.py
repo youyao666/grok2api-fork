@@ -1,7 +1,14 @@
 """
-Videos API route (OpenAI-compatible create endpoint).
+Videos API route (NewAPI / OpenAI-compatible endpoints).
+
+Endpoints:
+  POST /v1/videos                           — sync, Sora-style
+  POST /v1/video/generations                — async task submit
+  GET  /v1/video/generations/{task_id}      — async task query
+  POST /v1/video/extend                     — direct extension
 """
 
+import asyncio
 import base64
 import re
 import time
@@ -15,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from app.core.exceptions import UpstreamException, ValidationException
+from app.core.logger import logger
 from app.services.grok.services.model import ModelService
 from app.services.grok.services.video import VideoService
 from app.services.grok.services.video_extend import VideoExtendService
@@ -40,7 +48,52 @@ QUALITY_TO_RESOLUTION = {
     "high": "720p",
 }
 
+# ---------------------------------------------------------------------------
+#  Async task store (in-memory, same pattern as function/video.py)
+# ---------------------------------------------------------------------------
+_TASK_STORE: Dict[str, Dict[str, Any]] = {}
+_TASK_STORE_LOCK = asyncio.Lock()
+_TASK_TTL = 3600  # 1 hour
 
+
+async def _clean_tasks(now: float) -> None:
+    expired = [
+        tid for tid, info in _TASK_STORE.items()
+        if now - float(info.get("created_at") or 0) > _TASK_TTL
+    ]
+    for tid in expired:
+        _TASK_STORE.pop(tid, None)
+
+
+async def _store_task(task_id: str, data: Dict[str, Any]) -> None:
+    now = time.time()
+    async with _TASK_STORE_LOCK:
+        await _clean_tasks(now)
+        _TASK_STORE[task_id] = data
+
+
+async def _get_task(task_id: str) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    async with _TASK_STORE_LOCK:
+        await _clean_tasks(now)
+        info = _TASK_STORE.get(task_id)
+        if not info:
+            return None
+        if now - float(info.get("created_at") or 0) > _TASK_TTL:
+            _TASK_STORE.pop(task_id, None)
+            return None
+        return dict(info)
+
+
+async def _update_task(task_id: str, updates: Dict[str, Any]) -> None:
+    async with _TASK_STORE_LOCK:
+        if task_id in _TASK_STORE:
+            _TASK_STORE[task_id].update(updates)
+
+
+# ---------------------------------------------------------------------------
+#  Request models
+# ---------------------------------------------------------------------------
 class VideoCreateRequest(BaseModel):
     """Supported create params only; unknown fields are ignored by design."""
 
@@ -48,16 +101,37 @@ class VideoCreateRequest(BaseModel):
 
     prompt: Optional[str] = Field("", description="Video prompt")
     model: Optional[str] = Field(VIDEO_MODEL_ID, description="Model id")
-    size: Optional[str] = Field("1792x1024", description="Output size")
+    size: Optional[str] = Field("1792x1024", description="Output size (WxH)")
     seconds: Optional[int] = Field(6, description="Video length in seconds")
     quality: Optional[str] = Field("standard", description="Quality: standard/high")
     image_reference: Optional[Any] = Field(
         None,
-        description="Image references using chat/completions content-block array format: [{type:'image_url', image_url:{url:'...'}}] or an array of plain URL strings",
+        description="Image references: [{type:'image_url', image_url:{url:'...'}}] or URL string array",
     )
     input_reference: Optional[Any] = Field(
         None, description="Multipart input reference file"
     )
+
+
+class VideoGenRequest(BaseModel):
+    """NewAPI /v1/video/generations compatible request."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    model: Optional[str] = Field(VIDEO_MODEL_ID, description="Model id")
+    prompt: Optional[str] = Field("", description="Text description prompt")
+    image: Optional[str] = Field(None, description="Image input as URL or Base64")
+    duration: Optional[int] = Field(None, description="Video length in seconds")
+    seconds: Optional[int] = Field(None, description="Alias for duration")
+    width: Optional[int] = Field(None, description="Video width")
+    height: Optional[int] = Field(None, description="Video height")
+    size: Optional[str] = Field(None, description="Output size (WxH), alternative to width/height")
+    quality: Optional[str] = Field("standard", description="Quality: standard/high")
+    n: Optional[int] = Field(1, description="Number of videos to generate")
+    response_format: Optional[str] = Field(None, description="Response format")
+    user: Optional[str] = Field(None, description="User identifier")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Extended parameters")
+    image_reference: Optional[Any] = Field(None, description="Image references array")
 
 
 class VideoExtendDirectRequest(BaseModel):
@@ -76,6 +150,9 @@ class VideoExtendDirectRequest(BaseModel):
     resolution: str = Field("480p", description="Mapped to resolutionName")
 
 
+# ---------------------------------------------------------------------------
+#  Validation helpers
+# ---------------------------------------------------------------------------
 def _raise_validation_error(exc: ValidationError) -> None:
     errors = exc.errors()
     if errors:
@@ -122,9 +199,6 @@ def _normalize_model(model: Optional[str]) -> str:
             code="model_not_supported",
         )
     model_info = ModelService.get(requested)
-    # grok.com web currently sends video generation through app-chat with
-    # modelName=grok-3 plus toolOverrides.videoGen=true, so allow that input
-    # here without requiring the chat model itself to be flagged as is_video.
     if requested == "grok-3":
         return requested
     if not model_info or not model_info.is_video:
@@ -146,6 +220,20 @@ def _normalize_size(size: Optional[str]) -> Tuple[str, str]:
             code="invalid_size",
         )
     return value, aspect_ratio
+
+
+def _size_from_dimensions(width: Optional[int], height: Optional[int]) -> Optional[str]:
+    """Convert width/height to a size string if both are given."""
+    if width and height:
+        candidate = f"{width}x{height}"
+        if candidate in SIZE_TO_ASPECT:
+            return candidate
+        # Try to find the closest match
+        for sz in SIZE_TO_ASPECT:
+            w, h = sz.split("x")
+            if int(w) == width and int(h) == height:
+                return sz
+    return None
 
 
 def _normalize_quality(quality: Optional[str]) -> Tuple[str, str]:
@@ -235,14 +323,7 @@ def _parse_image_reference_item(value: Any, idx: int) -> str:
 
 
 def _parse_image_references(value: Any) -> List[str]:
-    """Parse image_reference into a list of validated URL strings.
-
-    Uses the same content-block format as chat/completions.
-    Accepts:
-      - None / ""  -> []
-      - ["url", {"type": "image_url", ...}, ...] -> [url, ...]
-      - JSON string of an array (for multipart/form-data)
-    """
+    """Parse image_reference into a list of validated URL strings."""
     if value is None or value == "":
         return []
 
@@ -365,56 +446,67 @@ def _multipart_create_schema(default_seconds: int) -> Dict[str, Any]:
     }
 
 
-def _build_create_response(
+# ---------------------------------------------------------------------------
+#  Response builders (NewAPI-compatible)
+# ---------------------------------------------------------------------------
+def _build_video_response(
+    *,
+    task_id: str,
+    model: str,
+    status: str,
+    prompt: str = "",
+    size: str = "",
+    seconds: int = 6,
+    quality: str = "standard",
+    url: str = "",
+    created_at: int = 0,
+    completed_at: int = 0,
+    progress: int = 0,
+    error: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build NewAPI-compatible video response."""
+    ts = created_at or int(time.time())
+    resp: Dict[str, Any] = {
+        "id": task_id,
+        "object": "video",
+        "model": model,
+        "status": status,
+        "progress": progress,
+        "created_at": ts,
+        "completed_at": completed_at or (ts if status == "completed" else 0),
+        "expires_at": ts + _TASK_TTL if status == "completed" else 0,
+        "seconds": str(seconds),
+        "size": size,
+        "prompt": prompt,
+        "quality": quality,
+    }
+    if status == "completed" and url:
+        resp["url"] = url
+        resp["format"] = "mp4"
+    if error:
+        resp["error"] = error
+    else:
+        resp["error"] = None
+    resp["metadata"] = metadata or {}
+    return resp
+
+
+# ---------------------------------------------------------------------------
+#  Core video generation logic
+# ---------------------------------------------------------------------------
+async def _generate_video(
     *,
     model: str,
     prompt: str,
     size: str,
-    seconds: int,
+    aspect_ratio: str,
     quality: str,
-    url: str,
-) -> Dict[str, Any]:
-    ts = int(time.time())
-    return {
-        "id": f"video_{uuid.uuid4().hex[:24]}",
-        "object": "video",
-        "created_at": ts,
-        "completed_at": ts,
-        "status": "completed",
-        "model": model,
-        "prompt": prompt,
-        "size": size,
-        "seconds": str(seconds),
-        "quality": quality,
-        "url": url,
-    }
-
-
-async def _create_video_from_payload(
-    payload: BaseModel,
+    resolution: str,
+    seconds: int,
     references: List[str],
-    *,
-    require_extension: bool = False,
-) -> JSONResponse:
-    prompt = (payload.prompt or "").strip()
-    if not prompt and not references:
-        raise ValidationException(
-            message="prompt is required when no image_reference or input_reference is provided",
-            param="prompt",
-            code="invalid_request_error",
-        )
-
-    model = _normalize_model(payload.model)
-    size, aspect_ratio = _normalize_size(payload.size)
-    quality, resolution = _normalize_quality(payload.quality)
-    seconds = _normalize_seconds(payload.seconds)
-    if require_extension and seconds <= 6:
-        raise ValidationException(
-            message="seconds must be between 7 and 30 for /video/extend",
-            param="seconds",
-            code="invalid_seconds",
-        )
-
+) -> str:
+    """Run video generation and return the video URL."""
     content: List[Dict[str, Any]] = []
     if prompt:
         content.append({"type": "text", "text": prompt})
@@ -441,19 +533,12 @@ async def _create_video_from_payload(
     video_url = _extract_video_url(rendered)
     if not video_url:
         raise UpstreamException("Video generation failed: missing video URL")
-
-    return JSONResponse(
-        content=_build_create_response(
-            model=model,
-            prompt=prompt,
-            size=size,
-            seconds=seconds,
-            quality=quality,
-            url=video_url,
-        )
-    )
+    return video_url
 
 
+# ---------------------------------------------------------------------------
+#  POST /v1/videos  (Sora-style sync endpoint)
+# ---------------------------------------------------------------------------
 @router.post(
     "/videos",
     openapi_extra={
@@ -468,8 +553,8 @@ async def _create_video_from_payload(
 )
 async def create_video(request: Request):
     """
-    Videos create endpoint.
-    Supports JSON and multipart/form-data using only reverse-supported params.
+    Videos create endpoint (sync).
+    Returns NewAPI-compatible response with completed status.
     """
     content_type = (request.headers.get("content-type") or "").lower()
     if "application/json" in content_type:
@@ -477,9 +562,7 @@ async def create_video(request: Request):
             raw = await request.json()
         except ValueError:
             raise ValidationException(
-                message=(
-                    "Invalid JSON in request body. Please check for trailing commas or syntax errors."
-                ),
+                message="Invalid JSON in request body.",
                 param="body",
                 code="json_invalid",
             )
@@ -494,29 +577,251 @@ async def create_video(request: Request):
         except ValidationError as exc:
             _raise_validation_error(exc)
         references = await _build_references_for_json(payload)
-        return await _create_video_from_payload(
-            payload, references, require_extension=False
+    else:
+        form = await request.form()
+        payload, references = await _build_payload_and_references_for_form(
+            schema=VideoCreateRequest,
+            prompt=form.get("prompt"),
+            model=form.get("model"),
+            size=form.get("size"),
+            seconds=form.get("seconds"),
+            quality=form.get("quality"),
+            image_reference=form.get("image_reference"),
+            input_reference=form.get("input_reference"),
         )
 
-    form = await request.form()
-    payload, references = await _build_payload_and_references_for_form(
-        schema=VideoCreateRequest,
-        prompt=form.get("prompt"),
-        model=form.get("model"),
-        size=form.get("size"),
-        seconds=form.get("seconds"),
-        quality=form.get("quality"),
-        image_reference=form.get("image_reference"),
-        input_reference=form.get("input_reference"),
+    prompt = (payload.prompt or "").strip()
+    if not prompt and not references:
+        raise ValidationException(
+            message="prompt is required when no image_reference or input_reference is provided",
+            param="prompt",
+            code="invalid_request_error",
+        )
+
+    model = _normalize_model(payload.model)
+    size, aspect_ratio = _normalize_size(payload.size)
+    quality, resolution = _normalize_quality(payload.quality)
+    seconds = _normalize_seconds(payload.seconds)
+
+    task_id = f"video_{uuid.uuid4().hex[:24]}"
+
+    video_url = await _generate_video(
+        model=model,
+        prompt=prompt,
+        size=size,
+        aspect_ratio=aspect_ratio,
+        quality=quality,
+        resolution=resolution,
+        seconds=seconds,
+        references=references,
     )
-    return await _create_video_from_payload(
-        payload, references, require_extension=False
+
+    return JSONResponse(
+        content=_build_video_response(
+            task_id=task_id,
+            model=model,
+            status="completed",
+            prompt=prompt,
+            size=size,
+            seconds=seconds,
+            quality=quality,
+            url=video_url,
+            progress=100,
+        )
     )
 
 
-@router.post(
-    "/video/extend",
-)
+# ---------------------------------------------------------------------------
+#  POST /v1/video/generations  (async task submit)
+# ---------------------------------------------------------------------------
+@router.post("/video/generations")
+async def create_video_generation(request: Request):
+    """
+    Async video generation task — NewAPI compatible.
+    Returns task_id + status=queued, then generates in background.
+    """
+    content_type = (request.headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        try:
+            raw = await request.json()
+        except ValueError:
+            raise ValidationException(
+                message="Invalid JSON in request body.",
+                param="body",
+                code="json_invalid",
+            )
+        if not isinstance(raw, dict):
+            raise ValidationException(
+                message="Request body must be a JSON object",
+                param="body",
+                code="invalid_request_error",
+            )
+        try:
+            payload = VideoGenRequest.model_validate(raw)
+        except ValidationError as exc:
+            _raise_validation_error(exc)
+    else:
+        form = await request.form()
+        try:
+            payload = VideoGenRequest.model_validate(
+                {
+                    "model": form.get("model"),
+                    "prompt": form.get("prompt"),
+                    "image": form.get("image"),
+                    "duration": form.get("duration"),
+                    "seconds": form.get("seconds"),
+                    "size": form.get("size"),
+                    "quality": form.get("quality"),
+                    "width": form.get("width"),
+                    "height": form.get("height"),
+                    "n": form.get("n"),
+                }
+            )
+        except ValidationError as exc:
+            _raise_validation_error(exc)
+
+    prompt = (payload.prompt or "").strip()
+
+    # Build references from image field or image_reference
+    references: List[str] = []
+    if payload.image:
+        img = payload.image.strip()
+        if img:
+            references.append(_validate_reference_value(img, "image"))
+    parsed_refs = _parse_image_references(getattr(payload, "image_reference", None))
+    references.extend(parsed_refs)
+
+    if not prompt and not references:
+        raise ValidationException(
+            message="prompt is required when no image is provided",
+            param="prompt",
+            code="invalid_request_error",
+        )
+
+    model = _normalize_model(payload.model)
+
+    # Resolve size: prefer explicit size, then width/height, then default
+    size_str = payload.size
+    if not size_str:
+        size_str = _size_from_dimensions(payload.width, payload.height)
+    if not size_str:
+        size_str = "1792x1024"
+    size, aspect_ratio = _normalize_size(size_str)
+
+    quality, resolution = _normalize_quality(payload.quality)
+
+    # Resolve duration: prefer duration, then seconds, then default
+    dur = payload.duration or payload.seconds or 6
+    seconds = _normalize_seconds(dur)
+
+    task_id = f"video_{uuid.uuid4().hex[:24]}"
+    created_at = int(time.time())
+
+    # Store task as queued
+    task_data = {
+        "id": task_id,
+        "model": model,
+        "prompt": prompt,
+        "size": size,
+        "aspect_ratio": aspect_ratio,
+        "quality": quality,
+        "resolution": resolution,
+        "seconds": seconds,
+        "references": references,
+        "status": "queued",
+        "progress": 0,
+        "url": "",
+        "error": None,
+        "created_at": created_at,
+        "completed_at": 0,
+        "metadata": payload.metadata or {},
+    }
+    await _store_task(task_id, task_data)
+
+    # Launch background generation
+    asyncio.create_task(_run_video_task(task_id))
+
+    return JSONResponse(
+        content={
+            "task_id": task_id,
+            "status": "queued",
+        }
+    )
+
+
+async def _run_video_task(task_id: str) -> None:
+    """Background coroutine that generates video and updates the task store."""
+    task = await _get_task(task_id)
+    if not task:
+        return
+
+    await _update_task(task_id, {"status": "in_progress", "progress": 10})
+
+    try:
+        video_url = await _generate_video(
+            model=task["model"],
+            prompt=task["prompt"],
+            size=task["size"],
+            aspect_ratio=task["aspect_ratio"],
+            quality=task["quality"],
+            resolution=task["resolution"],
+            seconds=task["seconds"],
+            references=task.get("references", []),
+        )
+        await _update_task(task_id, {
+            "status": "completed",
+            "progress": 100,
+            "url": video_url,
+            "completed_at": int(time.time()),
+        })
+    except Exception as e:
+        logger.warning(f"Video generation task {task_id} failed: {e}")
+        await _update_task(task_id, {
+            "status": "failed",
+            "progress": 0,
+            "error": {"code": "generation_failed", "message": str(e)},
+        })
+
+
+# ---------------------------------------------------------------------------
+#  GET /v1/video/generations/{task_id}  (async task query)
+# ---------------------------------------------------------------------------
+@router.get("/video/generations/{task_id}")
+async def get_video_generation(task_id: str):
+    """
+    Query async video generation task status — NewAPI compatible.
+    """
+    task = await _get_task(task_id)
+    if not task:
+        raise ValidationException(
+            message=f"Video task '{task_id}' not found",
+            param="task_id",
+            code="not_found",
+        )
+
+    return JSONResponse(
+        content=_build_video_response(
+            task_id=task["id"],
+            model=task.get("model", VIDEO_MODEL_ID),
+            status=task.get("status", "queued"),
+            prompt=task.get("prompt", ""),
+            size=task.get("size", ""),
+            seconds=task.get("seconds", 6),
+            quality=task.get("quality", "standard"),
+            url=task.get("url", ""),
+            created_at=task.get("created_at", 0),
+            completed_at=task.get("completed_at", 0),
+            progress=task.get("progress", 0),
+            error=task.get("error"),
+            metadata=task.get("metadata"),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+#  POST /v1/video/extend  (direct extension, unchanged)
+# ---------------------------------------------------------------------------
+@router.post("/video/extend")
 async def extend_video(request: VideoExtendDirectRequest):
     """
     Extension endpoint (non-OpenAI-compatible direct mapping).

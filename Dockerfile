@@ -64,6 +64,7 @@ RUN apk add --no-cache \
     libcurl \
     tini \
     curl \
+    su-exec \
     && addgroup -S appgrp \
     && adduser -S appusr -G appgrp
 
@@ -78,15 +79,14 @@ COPY main.py ./
 COPY scripts ./scripts
 
 RUN mkdir -p /app/data /app/logs \
-    && chown -R appusr:appgrp /app/data /app/logs \
+    && chown -R appusr:appgrp /app /app/data /app/logs \
     && chmod +x /app/scripts/entrypoint.sh \
     && sed -i 's/\r$//' /app/scripts/*.sh
 
 EXPOSE 8000
 
-USER appusr
-
 # tini 作为 PID 1，正确处理信号转发
+# 注意：先以 root 启动 entrypoint 处理目录权限，再在 entrypoint 中降权
 ENTRYPOINT ["tini", "--", "/app/scripts/entrypoint.sh"]
 
 CMD ["sh", "-c", "granian --interface asgi --host ${SERVER_HOST:-0.0.0.0} --port ${SERVER_PORT:-8000} --workers ${SERVER_WORKERS:-1} main:app"]
